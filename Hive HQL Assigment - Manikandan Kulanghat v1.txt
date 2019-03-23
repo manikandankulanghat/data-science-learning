@@ -1,0 +1,421 @@
+/* 
+########################################################
+Assignment on Hive SQL - Upgrad
+Developer: Manikandan Kulanghat
+Date: 2/23/2019
+########################################################
+*/
+
+--Adding the JAR to support 
+ADD JAR /opt/cloudera/parcels/CDH/lib/hive/lib/hive-hcatalog-core-1.1.0-cdh5.11.2.jar;
+
+
+/*########################     Initial Data Load    #############################*/	 
+
+-- Drop the table if it already exists
+drop table mani_nyc_yellow_cab_raw;
+
+-- Creating an internal table since this will be dropped at the end of the assignment.
+create external table if not exists mani_nyc_yellow_cab_raw
+(
+ VendorID int,
+ tpep_pickup_datetime timestamp,
+ tpep_dropoff_datetime timestamp,
+ passenger_count int,
+ trip_distance double,
+ RatecodeID int,
+ store_and_fwd_flag string,
+ PULocationID int,
+ DOLocationID int,
+ payment_type int,
+ fare_amount double,
+ extra double,
+ mta_tax double,
+ tip_amount double,
+ tolls_amount double,
+ improvement_surcharge double,
+ total_amount double
+) row format delimited fields terminated by ","
+lines terminated by "\n"
+location "/common_folder/nyc_taxi_data/"
+tblproperties ('skip.header.line.count' = '1');
+
+-- Observation 1: The order of columns in data dictionary & the file are different. 
+
+/*########################     Data Quality Checks    #############################*/	 
+
+-- Read Sample Data
+SELECT * FROM mani_nyc_yellow_cab_raw LIMIT 100;
+
+select count(*) from mani_nyc_yellow_cab_raw; -- 1174569
+
+-- Check if all the data is from 2017
+select year(tpep_pickup_datetime),
+       month(tpep_pickup_datetime),
+	   month(tpep_pickup_datetime),
+	   count(VendorID) 
+  from mani_nyc_yellow_cab_raw 
+ group by year(tpep_pickup_datetime),
+       month(tpep_pickup_datetime),
+	   month(tpep_pickup_datetime) ;
+    /* Observation:
+            1. Here we see that we have 1 record from Jan'03, Dec'09 & Jan'18
+            2. We have 2 records from Dec'08
+            3. We have 6 records from Oct'17
+        The above records needs to deleted for our analysis. 
+        The remaining records ar:
+            1. 580300 records in Nov'17.
+            2. 594255 records in Dec'17.*/
+            
+-- Gather stats to check for nulls & distinct values in each columns. 
+analyze table mani_nyc_yellow_cab_raw compute statistics for columns;
+
+describe formatted mani_nyc_yellow_cab_raw  VendorID ; -- 2 unique values & 0 nulls. 
+describe formatted mani_nyc_yellow_cab_raw  tpep_pickup_datetime; -- 0 nulls.
+describe formatted mani_nyc_yellow_cab_raw  tpep_dropoff_datetime ; -- 0 nulls
+describe formatted mani_nyc_yellow_cab_raw  passenger_count ; -- 0 nulls. 11 distinct values. Max value is 9. ***Max value 9 while having 11 distinct values seems to be odd. Also 0 passenger count is odd.
+describe formatted mani_nyc_yellow_cab_raw  trip_distance ; -- 0 nulls. But there are trips with 0.0 as distance which needs to be analyzed. 
+describe formatted mani_nyc_yellow_cab_raw  RatecodeID ; -- Rate code ID has only 6 values. However, 
+describe formatted mani_nyc_yellow_cab_raw  store_and_fwd_flag ; -- 0 Nulls & 2 values. 
+describe formatted mani_nyc_yellow_cab_raw  PULocationID ; -- 0 Nulls & there are 180 unique locations/zones. 
+describe formatted mani_nyc_yellow_cab_raw  DOLocationID ; -- 0 Nulls & there are 180 unique locations/zones.
+describe formatted mani_nyc_yellow_cab_raw  payment_type ; -- 0 null values. However, min says 1 & max says 4 which is odd for an integer field where the count has 5 values..
+describe formatted mani_nyc_yellow_cab_raw  fare_amount ; -- 0 null values. But there are negative fares which seems to be odd. Max fare is $650.00.
+describe formatted mani_nyc_yellow_cab_raw  extra ; -- 0 null values. But there is a negative min value which needs analysis. Max extra is $4.80. It has 14 distinct values whereas Data Dictionary says it can have only $0.50 or $1.
+describe formatted mani_nyc_yellow_cab_raw  mta_tax ; -- 0 null values. But there is a negative min value min value which needs analysis. Max MTA Tax is $11.40. 
+describe formatted mani_nyc_yellow_cab_raw  tip_amount ; -- 0 null values. But there is a negative min value min value which needs analysis. Max Tip amount is $450.40. 
+describe formatted mani_nyc_yellow_cab_raw  tolls_amount ; -- 0 null values. But there is a negative min value min value which needs analysis. Max toll amount is $895.89 which is really high when you compare that max fare in the data set is $650.00
+describe formatted mani_nyc_yellow_cab_raw  improvement_surcharge ; -- 0 null values. But there is a negative min value min value which needs analysis. Distinct count of improve_surcharge is 4.
+describe formatted mani_nyc_yellow_cab_raw  total_amount ; -- 0 null values. But there is a negative min value min value which needs analysis. Max total is $928.19
+
+-- passenger_count & payment_type additional analysis. 
+select passenger_count,
+       count(*) as count
+  from mani_nyc_yellow_cab_raw 
+ group by passenger_count;
+ 
+select payment_type,
+       count(*) as count
+  from mani_nyc_yellow_cab_raw 
+ group by payment_type;
+-- Based on the above 2 queries, I can conclude that the compute stats is always taking 1 extra value either from header or a last null record. 
+-- That is the reason, when we have 4 payment values - 1,2,3 & 4, the distinct_count in the stats showed 5.
+
+-- Analyze rides with 0 passenger count
+select VendorID,
+       COUNT(*) as count
+  from mani_nyc_yellow_cab_raw 
+ where passenger_count <= 0
+ group by VendorID;
+-- Vendor 1 has made 6813 trips & vendor 2 has made 11 trips with 0 passengers.
+
+-- Check the records values are negative. 
+select VendorID,
+       COUNT(*) as count
+  from mani_nyc_yellow_cab_raw 
+ where (fare_amount < 0.00
+   or extra < 0.00
+   or mta_tax < 0.00
+   or tip_amount < 0.00
+   or tolls_amount < 0.00
+   or improvement_surcharge < 0.00
+   or total_amount < 0.00)
+group by VendorID;
+--There are 559 records with Negative values. Since the amounts cannot be negative for a ride, I would be ignoring these records to get a clean dataset. There are 558 records are from vendor 2 & 1 record from vendor 1.
+
+--Analyzing in detail about the $0 trips. 
+select VendorID,
+       payment_type,
+       COUNT(*) as count
+  from mani_nyc_yellow_cab_raw 
+ where total_amount = 0.00
+ group by VendorID,
+       payment_type;
+ --There are 123 records with $0 total amount of which 81 records are from vendor 2 & 42 records from Vendor 1. 
+
+--Trying to see the $0 trips that are having distance <> 0.00
+select VendorID,
+       trip_distance,
+       COUNT(*) as count
+  from mani_nyc_yellow_cab_raw 
+ where total_amount = 0.00
+ group by VendorID,
+       trip_distance;
+having trip_distance <> 0.00;
+ --There are 123 records with $0 total amount of which 81 records are from vendor 2 & 42 records from Vendor 1. 
+
+
+--Trying to understand the 0 distance trips here. 
+select VendorID,
+       payment_type,
+       COUNT(*) as count
+  from mani_nyc_yellow_cab_raw 
+ where trip_distance = 0.00
+ group by VendorID,
+       payment_type;
+-- Here Vendor 1 has made 4217 trips & vendor 2 has made 3185 trips. Since there is no identification of a canceled trip or none of the zero distance trip are flagged as payment_type 6(voided charge), we will be ignoring these records. 
+
+-- Data Dictionary says extra can have 2 values $0.50 or $1 b
+select VendorID,
+       extra,
+       COUNT(*) as count
+  from mani_nyc_yellow_cab_raw 
+ group by VendorID,
+       extra;
+       
+       -- There are more records with values other than 0, 0.5 & 1. 
+select VendorID,
+       COUNT(*) as count
+  from mani_nyc_yellow_cab_raw 
+ where extra not in (0.00,0.50, 1.00)
+ group by VendorID;
+-- Here we see that 3033 trips from vendor 2 & 1823 trips from vendor 1 are charged with extra amounts that are not in 0.00, 0.50 & 1.00. 
+
+-- -- Data Dictionary says 	improvement_surcharge can be only $0.30. However we are seeing different values in the data. 
+select VendorID,
+       improvement_surcharge,
+       COUNT(*) as count
+  from mani_nyc_yellow_cab_raw 
+ group by VendorID,
+       improvement_surcharge;
+      -- There are 61 trips from vendor 1 & 788 trips from vendor 2 that are having  improvement_surcharge <> $0.30
+
+/*########################     Data Cleanup & Load to Partitioned ORC Table #############################*/	 
+
+-- Valid record count after data cleanup: 
+/* 
+   1. Considering only trips that have total amount > $0.00. 
+   2. Considering only trips where the distance traveled is greater than 0.00.
+   3. Considering only trips where there was at least 1 passenger. 
+   4. Considering only trips where the extra charged was $0.00 or $0.50 or $1.00.
+   5. Considering only trips where the improvement surcharge = $0.30    */
+
+select count(*) as count
+  from mani_nyc_yellow_cab_raw
+ where year(tpep_pickup_datetime) = 2017
+   and month(tpep_pickup_datetime) in (11,12)
+   and total_amount > 0.00
+   and trip_distance > 0.00
+   and passenger_count > 0
+   and extra in (0.00,0.50, 1.00)
+   and improvement_surcharge = 0.30;
+
+-- Valid record count = 1155571
+
+--ORC Partitioned & bucketed table creation. 
+SET hive.exec.max.dynamic.partitions=100000;
+SET hive.exec.max.dynamic.partitions.pernode=100000;
+
+drop table mani_nyc_yellow_cab_orc_part;
+
+--Here am creating an internal table which I can drop along with the data at the end of the assignment.
+-- Am creating partition only by month since all the data belong to the same year. 
+create table if not exists mani_nyc_yellow_cab_orc_part
+(
+ VendorID int,
+ tpep_pickup_datetime timestamp,
+ tpep_dropoff_datetime timestamp,
+ passenger_count int,
+ trip_distance double,
+ RatecodeID int,
+ store_and_fwd_flag string,
+ PULocationID int,
+ DOLocationID int,
+ payment_type int,
+ fare_amount double,
+ extra double,
+ mta_tax double,
+ tip_amount double,
+ tolls_amount double,
+ improvement_surcharge double,
+ total_amount double,
+ year int,
+ date date
+) partitioned by (month int)
+clustered by (date) into 5 buckets
+stored as orc 
+location '/user/manikandan.kulanghat_gmail/nyc_taxi_cluster' -- ***** If you don't have access to my directory, then either remove the location clause or replace "manikandan.kulanghat_gmail" with your user directory. *****
+tblproperties ("orc.compress"="SNAPPY");
+
+-- Inserting 1155571 records in the table.
+insert overwrite table mani_nyc_yellow_cab_orc_part partition(month)
+select VendorID ,
+       tpep_pickup_datetime ,
+       tpep_dropoff_datetime ,
+       passenger_count ,
+       trip_distance ,
+       RatecodeID ,
+       store_and_fwd_flag ,
+       PULocationID ,
+       DOLocationID ,
+       payment_type ,
+       fare_amount ,
+       extra ,
+       mta_tax ,
+       tip_amount ,
+       tolls_amount ,
+       improvement_surcharge ,
+       total_amount,
+       year(tpep_pickup_datetime) as year,
+       to_date(tpep_pickup_datetime) as date,
+       month(tpep_pickup_datetime) as month
+  from mani_nyc_yellow_cab_raw
+ where year(tpep_pickup_datetime) = 2017
+   and month(tpep_pickup_datetime) in (11,12)
+   and total_amount > 0.00
+   and trip_distance > 0.00
+   and passenger_count > 0
+   and extra in (0.00,0.50, 1.00)
+   and improvement_surcharge = 0.30;
+
+-- Validation of inserted records. 
+select count(*) as count from mani_nyc_yellow_cab_orc_part; -- Total Count 1155571 
+select count(*) as count from mani_nyc_yellow_cab_raw; -- Total Count 1174569 
+
+/*########################     Analysis 1  #############################*/
+
+-- #### - Compare the overall average fare per trip for November and December.
+
+select year,
+       month,
+       round(avg(fare_amount),2) as avg_fare
+  from mani_nyc_yellow_cab_orc_part
+ group by year,
+       month;
+       
+       -- Rounded to 2 decimal since fare is a currency. 
+       -- The average fare for November is slightly higher at $12.91 whereas the Average fare for December 2017 is 21 cents lower at $12.70.
+
+-- #### - Explore the ‘number of passengers per trip’ - how many trips are made by each level of ‘Passenger_count’? Do most people travel solo or with other people?
+
+select passenger_count,
+       count(*) as count
+  from mani_nyc_yellow_cab_orc_part
+ group by passenger_count;
+ -- Here we can see that people prefer to travel alone. 
+ -- However, let see the % of trips with each passenger count in the next query. 
+ 
+select passenger_count,
+       round((count(passenger_count)/b.total)*100.00,2) as Percentage_of_Total
+  from mani_nyc_yellow_cab_orc_part a, 
+       (select count(*) as total 
+          from mani_nyc_yellow_cab_orc_part) as b
+ group by passenger_count,
+       total;
+ -- Here we can see that 70% of the rides are with single passenger & thus we can strongly see that people prefer to travel alone. 
+
+-- #### - Which is the most preferred mode of payment?
+
+select case when payment_type = 1 then 'Credit Card'
+            when payment_type = 2 then 'Cash'
+            when payment_type = 3 then 'No charge'
+            when payment_type = 4 then 'Dispute'
+            when payment_type = 5 then 'Unknown'
+            when payment_type = 6 then 'Voided trip'
+        else 'Unknown' end as payment_type,
+       round((count(payment_type)/b.total)*100.00,2) as Percentage_of_Total
+  from mani_nyc_yellow_cab_orc_part a, 
+       (select count(*) as total 
+          from mani_nyc_yellow_cab_orc_part) as b
+ group by payment_type,
+       total;
+       -- Here we can see that 67.48% of the trips are paid by Credit card & 31.99% of the trips are paid by cash. 
+
+-- #### - What is the average tip paid per trip? Compare the average tip with the 25th, 50th and 75th percentiles and comment whether the ‘average tip’ is a representative statistic (of the central tendency) of ‘tip amount paid’. Hint: You may use percentile_approx(DOUBLE col, p): Returns an approximate pth percentile of a numeric column (including floating point types) in the group.
+
+select round(avg(tip_amount),2) as average_tip,
+       percentile_approx(tip_amount, 0.25) 25th_percentile_tip,
+       percentile_approx(tip_amount, 0.50) 50th_percentile_tip,
+       percentile_approx(tip_amount, 0.75) 75th_percentile_tip
+  from mani_nyc_yellow_cab_orc_part;
+       -- Here we can see that 50th percentile is $1.83 whereas the 50th Percentile is only $1.36. This means that even though average is $1.83, 50% of teh tips provided are less than or equal to $1.36. 
+
+-- #### - Explore the ‘Extra’ (charge) variable - what fraction of total trips have an extra charge is levied?
+select extra,
+       round((count(extra)/b.total)*100.00,2) as Percentage_of_Total
+  from mani_nyc_yellow_cab_orc_part a, 
+       (select count(*) as total 
+          from mani_nyc_yellow_cab_orc_part) as b
+ group by extra,
+       total;
+ -- Here we can see that 53.87% of the trips are not changed any extra amount. 31.18% of the trips are charged $0.50 for rush hour. 14.94% of the trips are charged with $1.00 for overnight extra. 
+
+ select extra,
+        round((count(extra)/b.total)*100.00,2) as Percentage_of_Total
+   from (select case when extra = 0.00 then 'No Extra Charged' else 'Extra Charged' end as Extra 
+           from mani_nyc_yellow_cab_orc_part ) as a, 
+        (select count(*) as total 
+           from mani_nyc_yellow_cab_orc_part) as b
+  group by extra,
+        total;
+ -- By making some minor tweaks to the query, we can see that extra charge is levied for 46.13% of the trips. 
+ 
+/*########################     Analysis II  #############################*/
+
+-- #### - What is the correlation between the number of passengers on any given trip, and the tip paid per trip? Do multiple travelers tip more compared to solo travelers? Hint: Use CORR(Col_1, Col_2)
+
+select corr(passenger_count, tip_amount) as correlation
+  from mani_nyc_yellow_cab_orc_part;
+  -- The correlation is negative. This means passenger_count & tip_amount are inversely correlated & as the passenger count increases, the tip amount decreases.
+
+-- #### - Segregate the data into five segments of ‘tip paid’: [0-5), [5-10), [10-15) , [15-20) and >=20. Calculate the percentage share of each bucket (i.e. the fraction of trips falling in each bucket).
+
+select Range_of_tip_amount,
+       round((count(Range_of_tip_amount)/b.total)*100.00,2) as Percentage_of_Total
+  from (select case when tip_amount between 0.00 and 5.00 then 'Tip between $0.00 - $5.00'
+                    when tip_amount between 5.01 and 10.00 then 'Tip between $5.01 - $10.00'
+                    when tip_amount between 10.01 and 15.00 then 'Tip between $0.00 - $5.00'
+                    when tip_amount between 15.01 and 20.00 then 'Tip between $15.01 - $20.00'
+                    when tip_amount > 20.00 then 'Tip greater than $20'
+               else 'Other amount' end as Range_of_tip_amount
+          from mani_nyc_yellow_cab_orc_part ) as a, 
+       (select count(*) as total 
+          from mani_nyc_yellow_cab_orc_part) as b
+ group by Range_of_tip_amount,
+       total;
+       /* 
+          Tip between $0.00 - $5.00 is 94.63 %
+          Tip between $15.01 - $20.00 is 0.18 %
+          Tip between $5.01 - $10.00 is 5.12 %
+          Tip greater than $20 is 0.07 %
+       */
+
+-- #### - Which month has a greater average ‘speed’ - November or December? Note that the variable ‘speed’ will have to be derived from other metrics. Hint: You have columns for distance and time.
+
+SELECT month,
+       Round(avg(Round(trip_distance/((unix_timestamp(tpep_dropoff_datetime) - unix_timestamp(tpep_pickup_datetime))/3600.00),2)),2) as average_mph
+  from mani_nyc_yellow_cab_orc_part
+ group by month;
+  -- Here we see that for the month of November 2017 the average speed is 10.97 MPH and for the month of December it has slightly increased to 11.07 MPH.
+  
+-- #### - Analyze the average speed of the most happening days of the year, i.e. 31st December (New year’s eve) and 25th December (Christmas) and compare it with the overall average. 
+
+-- Average speed in the dataset
+select Round(avg(Round(trip_distance/((unix_timestamp(tpep_dropoff_datetime) - unix_timestamp(tpep_pickup_datetime))/3600.00),2)),2) as average_total_mph
+       from mani_nyc_yellow_cab_orc_part;
+          -- 11.02 MPH
+-- Average speed on Christmas & new year's eve.
+select date,
+       Round(avg(Round(trip_distance/((unix_timestamp(tpep_dropoff_datetime) - unix_timestamp(tpep_pickup_datetime))/3600.00),2)),2) as average_daily_mph
+ from  mani_nyc_yellow_cab_orc_part
+ where to_date(date) in ('2017-12-31','2017-12-25')
+ group by date;
+  -- Here we see that the average speed on both the days are slightly higher than the average. 
+  
+  -- Now let's try to find the % difference when compared to the average. 
+select date,
+       Round(((avg(Round(trip_distance/((unix_timestamp(tpep_dropoff_datetime) - unix_timestamp(tpep_pickup_datetime))/3600.00),2))/average_total_mph)-1)*100.00,2) as average_daily_mph
+ from  mani_nyc_yellow_cab_orc_part a,
+        (select Round(avg(Round(trip_distance/((unix_timestamp(tpep_dropoff_datetime) - unix_timestamp(tpep_pickup_datetime))/3600.00),2)),2) as average_total_mph
+           from mani_nyc_yellow_cab_orc_part) b
+ where to_date(date) in ('2017-12-31','2017-12-25')
+ group by date,
+       average_total_mph;
+       -- On Christmas i.e. Dec 25th, the average speed is 38.53% more than the overall average. On New Years Eve i.e. 31st December, the average speed is 20.23% more than the overall average.
+       
+/*########################     Table Drop  #############################*/
+
+drop table mani_nyc_yellow_cab_raw;
+drop table mani_nyc_yellow_cab_orc_part;
+
+-- ####################################################################
